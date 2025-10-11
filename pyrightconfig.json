@@ -1,0 +1,8 @@
+{
+  "typeCheckingMode": "off",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportOptionalCall": "none",
+  "reportGeneralTypeIssues": "none",
+  "reportUnboundVariable": "warning"
+}
