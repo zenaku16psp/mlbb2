@@ -4,6 +4,23 @@ from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from env import BOT_TOKEN, ADMIN_ID, ADMIN_GROUP_ID, DATA_FILE
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
+
+# MongoDB Connection
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    mongo_client.admin.command('ping')
+    db = mongo_client['mlbb_bot']
+    users_collection = db['users']
+    prices_collection = db['prices']
+    settings_collection = db['settings']
+    print("✅ MongoDB connection successful!")
+except ConnectionFailure:
+    print("❌ MongoDB connection failed! Using JSON fallback...")
+    mongo_client = None
+    db = None
 
 # Authorized users - only these users can use the bot
 AUTHORIZED_USERS = set()
@@ -77,6 +94,43 @@ def simple_reply(message_text):
                 "🆘 ***အကူအညီ လိုရင် /start နှိပ်ပါ။***")
 
 def load_data():
+    if db is not None:
+        # Use MongoDB
+        try:
+            # Get settings document
+            settings = settings_collection.find_one({"_id": "main_settings"})
+            if not settings:
+                settings = {
+                    "_id": "main_settings",
+                    "authorized_users": [],
+                    "admin_ids": [ADMIN_ID],
+                    "clone_bots": {}
+                }
+                settings_collection.insert_one(settings)
+            
+            # Get all users
+            users = {}
+            for user in users_collection.find():
+                user_id = user.pop("_id")
+                users[user_id] = user
+            
+            # Get all prices
+            prices = {}
+            price_doc = prices_collection.find_one({"_id": "prices"})
+            if price_doc:
+                prices = price_doc.get("items", {})
+            
+            return {
+                "users": users,
+                "prices": prices,
+                "authorized_users": settings.get("authorized_users", []),
+                "admin_ids": settings.get("admin_ids", [ADMIN_ID]),
+                "clone_bots": settings.get("clone_bots", {})
+            }
+        except Exception as e:
+            print(f"MongoDB error: {e}, using JSON fallback")
+    
+    # Fallback to JSON file
     if not os.path.exists(DATA_FILE):
         initial_data = {
             "users": {},
@@ -90,7 +144,6 @@ def load_data():
     try:
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
-            # Ensure all required keys exist
             if "users" not in data:
                 data["users"] = {}
             if "prices" not in data:
@@ -101,7 +154,6 @@ def load_data():
                 data["admin_ids"] = [ADMIN_ID]
             return data
     except json.JSONDecodeError:
-        # If file is corrupted, recreate it
         initial_data = {
             "users": {},
             "prices": {},
@@ -113,6 +165,39 @@ def load_data():
         return initial_data
 
 def save_data(data):
+    if db is not None:
+        # Use MongoDB
+        try:
+            # Save users
+            for user_id, user_data in data.get("users", {}).items():
+                users_collection.update_one(
+                    {"_id": user_id},
+                    {"$set": user_data},
+                    upsert=True
+                )
+            
+            # Save prices
+            prices_collection.update_one(
+                {"_id": "prices"},
+                {"$set": {"items": data.get("prices", {})}},
+                upsert=True
+            )
+            
+            # Save settings
+            settings_collection.update_one(
+                {"_id": "main_settings"},
+                {"$set": {
+                    "authorized_users": data.get("authorized_users", []),
+                    "admin_ids": data.get("admin_ids", [ADMIN_ID]),
+                    "clone_bots": data.get("clone_bots", {})
+                }},
+                upsert=True
+            )
+            return
+        except Exception as e:
+            print(f"MongoDB save error: {e}, using JSON fallback")
+    
+    # Fallback to JSON file
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -1960,17 +2045,108 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args
-    if len(args) != 2:
+    if len(args) < 2:
         await update.message.reply_text(
-            "❌ မှန်ကန်တဲ့အတိုင်း: /setprice <item> <price>\n\n"
-            "ဥပမာ:\n"
+            "❌ ***မှန်ကန်တဲ့အတိုင်း***:\n\n"
+            "***တစ်ခုချင်း***:\n"
+            "• `/setprice <item> <price>`\n"
             "• `/setprice wp1 7000`\n"
-            "• `/setprice 86 5500`\n"
-            "• `/setprice 12976 750000`"
+            "• `/setprice 86 5500`\n\n"
+            "***အစုလိုက် (Weekly Pass)***:\n"
+            "• `/setprice wp1 7000` - wp1-wp10 အားလုံး auto update\n\n"
+            "***အစုလိုက် (Normal Diamonds)***:\n"
+            "• `/setprice normal 1000 2000 3000...` - သတ်မှတ်ဈေးများ\n"
+            "• အစဉ်: 11,22,33,56,86,112,172,257,343,429,514,600,706,878,963,1049,1135,1412,2195,3688,5532,9288,12976\n\n"
+            "***အစုလိုက် (2X Diamonds)***:\n"
+            "• `/setprice 2x 3500 10000 16000 33000`\n"
+            "• အစဉ်: 55,165,275,565",
+            parse_mode="Markdown"
         )
         return
 
-    item = args[0]
+    custom_prices = load_prices()
+    item = args[0].lower()
+
+    # Handle batch updates
+    if item == "normal":
+        # Batch update for normal diamonds
+        normal_diamonds = ["11", "22", "33", "56", "86", "112", "172", "257", "343",
+                          "429", "514", "600", "706", "878", "963", "1049", "1135",
+                          "1412", "2195", "3688", "5532", "9288", "12976"]
+        
+        if len(args) - 1 != len(normal_diamonds):
+            await update.message.reply_text(
+                f"❌ ***Normal diamonds {len(normal_diamonds)} ခု လိုအပ်ပါတယ်!***\n\n"
+                f"***အစဉ်***: 11,22,33,56,86,112,172,257,343,429,514,600,706,878,963,1049,1135,1412,2195,3688,5532,9288,12976\n\n"
+                f"***ဥပမာ***:\n"
+                f"`/setprice normal 1000 2000 3000 4200 5100 8200 10200 15300 20400 25500 30600 35700 40800 51000 56100 61200 66300 81600 122400 204000 306000 510000 714000`",
+                parse_mode="Markdown"
+            )
+            return
+        
+        updated_items = []
+        try:
+            for i, diamond in enumerate(normal_diamonds):
+                price = int(args[i + 1])
+                if price < 0:
+                    await update.message.reply_text(f"❌ ဈေးနှုန်း ({diamond}) သုညထက် ကြီးရမည်!")
+                    return
+                custom_prices[diamond] = price
+                updated_items.append(f"{diamond}={price:,}")
+        except ValueError:
+            await update.message.reply_text("❌ ဈေးနှုန်းများ ကိန်းဂဏန်းဖြင့် ထည့်ပါ!")
+            return
+        
+        save_prices(custom_prices)
+        await update.message.reply_text(
+            f"✅ ***Normal Diamonds ဈေးနှုန်းများ ပြောင်းလဲပါပြီ!***\n\n"
+            f"💎 ***Update လုပ်ပြီး***: {len(updated_items)} items\n\n"
+            f"📝 Users တွေ /price ***နဲ့ အသစ်တွေ့မယ်။***",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif item == "2x":
+        # Batch update for 2X diamonds
+        double_pass = ["55", "165", "275", "565"]
+        
+        if len(args) - 1 != len(double_pass):
+            await update.message.reply_text(
+                f"❌ ***2X diamonds {len(double_pass)} ခု လိုအပ်ပါတယ်!***\n\n"
+                f"***အစဉ်***: 55,165,275,565\n\n"
+                f"***ဥပမာ***:\n"
+                f"`/setprice 2x 3500 10000 16000 33000`",
+                parse_mode="Markdown"
+            )
+            return
+        
+        updated_items = []
+        try:
+            for i, diamond in enumerate(double_pass):
+                price = int(args[i + 1])
+                if price < 0:
+                    await update.message.reply_text(f"❌ ဈေးနှုန်း ({diamond}) သုညထက် ကြီးရမည်!")
+                    return
+                custom_prices[diamond] = price
+                updated_items.append(f"{diamond}={price:,}")
+        except ValueError:
+            await update.message.reply_text("❌ ဈေးနှုန်းများ ကိန်းဂဏန်းဖြင့် ထည့်ပါ!")
+            return
+        
+        save_prices(custom_prices)
+        await update.message.reply_text(
+            f"✅ ***2X Diamonds ဈေးနှုန်းများ ပြောင်းလဲပါပြီ!***\n\n"
+            f"💎 ***Update လုပ်ပြီး***: {len(updated_items)} items\n\n"
+            f"📝 Users တွေ /price ***နဲ့ အသစ်တွေ့မယ်။***",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Handle single item or weekly pass auto-update
+    if len(args) != 2:
+        await update.message.reply_text("❌ တစ်ခုချင်း update မှာ 2 arguments လိုပါတယ်!")
+        return
+
     try:
         price = int(args[1])
         if price < 0:
@@ -1980,7 +2156,34 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ဈေးနှုန်း ကိန်းဂဏန်းဖြင့် ထည့်ပါ!")
         return
 
-    custom_prices = load_prices()
+    # Check if it's a weekly pass (wp1-wp10)
+    if item.startswith("wp") and len(item) > 2:
+        try:
+            wp_num = int(item[2:])
+            if 1 <= wp_num <= 10:
+                # Auto-update all weekly passes
+                updated_items = []
+                for i in range(1, 11):
+                    wp_key = f"wp{i}"
+                    wp_price = price * i
+                    custom_prices[wp_key] = wp_price
+                    updated_items.append(f"{wp_key}={wp_price:,}")
+                
+                save_prices(custom_prices)
+                
+                items_text = "\n".join([f"• {item}" for item in updated_items])
+                await update.message.reply_text(
+                    f"✅ ***Weekly Pass ဈေးနှုန်းများ Auto Update ပြီးပါပြီ!***\n\n"
+                    f"💎 ***Base Price (wp1)***: `{price:,} MMK`\n\n"
+                    f"***Updated Items***:\n{items_text}\n\n"
+                    f"📝 Users တွေ /price ***နဲ့ အသစ်တွေ့မယ်။***",
+                    parse_mode="Markdown"
+                )
+                return
+        except ValueError:
+            pass
+
+    # Single item update
     custom_prices[item] = price
     save_prices(custom_prices)
 
@@ -4771,3 +4974,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
