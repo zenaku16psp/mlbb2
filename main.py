@@ -8,7 +8,7 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
 # MongoDB Connection
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://wanglinmongodb:wanglin@cluster0.tny5vhz.mongodb.net/")
 try:
     mongo_client = MongoClient(MONGO_URI)
     mongo_client.admin.command('ping')
